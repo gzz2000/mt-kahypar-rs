@@ -1,9 +1,11 @@
-//! # mt-kahypar — Safe Rust bindings for Mt‑KaHyPar
+//! # mt-kahypar — (Non-official) Static & Safe Rust bindings for Mt‑KaHyPar
 //!
 //! **mt-kahypar** provides an idiomatic, ownership‑aware interface to the
 //! high‑performance C++ *Mt‑KaHyPar* (multi‑level hypergraph partitioner)
-//! library.  It keeps the raw pointers, thread pools and unsafe invariants
-//! hidden, so you can focus on algorithms instead of FFI foot‑guns.
+//! library.
+//!
+//! **mt-kahypar** compiles and links *Mt-KaHyPar* and all its dependencies
+//! (Boost and TBB) statically inside special namespaces.
 //!
 //! ---
 //!
@@ -11,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! mt-kahypar = "0.1"
+//! mt-kahypar = "0.2"
 //! ```
 //!
 //! ## Quick start
@@ -25,6 +27,8 @@
 //!     .k(4)                 // number of blocks
 //!     .epsilon(0.03)        // 3 % imbalance
 //!     .objective(Objective::Km1)
+//!     .seed(42)
+//!     .verbose(false)       // change to true to print detailed logs
 //!     .build()?;
 //!
 //! // 2. Load (or construct) the hypergraph to be partitioned.
@@ -33,7 +37,7 @@
 //! // 3. Partition it.
 //! let part = hg.partition()?;
 //!
-//! println!("cut = {} | imbalance = {:.2}%", part.cut(), part.imbalance()*100.0);
+//! println!("cut = {} | imbalance = {}%", part.cut(), part.imbalance()*100.0);
 //! # Ok::<(), mt_kahypar::Error>(())
 //! ```
 //!
@@ -51,12 +55,8 @@
 //! * All FFI handles (`Context`, `Hypergraph`, …) own their native resources
 //!   and free them via `Drop`.
 //! * Each handle stores an immutable reference to the `Context` it was created
-//!   with.  Mixing objects built from *different* contexts triggers a debug
+//!   with.  Mixing objects built from *different* contexts triggers an
 //!   assertion at the point of use.
-//! * The wrapper itself is `#![no_std]`‑ready (only `std::sync::Once` is
-//!   required).  Open an issue if you need a `core`‑only build.
-//! * Underlying C code may abort on OOM.  Consider running heavy workloads in
-//!   a separate process if that is a concern.
 //!
 //! ---
 //! For more details see the docs of individual types below or the upstream
@@ -150,7 +150,7 @@ impl From<sys::mt_kahypar_status_t> for Status {
 
 /// Objective functions.
 ///
-/// See https://github.com/gzz2000/mt-kahypar-sc/tree/master?tab=readme-ov-file#supported-objective-functions
+/// See [upstream docs](https://github.com/gzz2000/mt-kahypar-sc/tree/master?tab=readme-ov-file#supported-objective-functions) for their descriptions.
 #[derive(Clone, Copy)]
 pub enum Objective {
     /// Cut-Net Metric
@@ -634,6 +634,7 @@ impl<'ctx> TargetGraph<'ctx> {
 /* PartitionedHypergraph                                                     */
 /* ------------------------------------------------------------------------- */
 
+/// A partitioned hypergraph.
 pub struct PartitionedHypergraph<'ctx> {
     raw: sys::mt_kahypar_partitioned_hypergraph_t,
     ctx: &'ctx Context,
