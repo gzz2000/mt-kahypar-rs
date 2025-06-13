@@ -6,6 +6,7 @@ links = "mtkahypar"
 license = "MIT OR Apache-2.0"
 authors = ["Lars Gottesbüren <lars.gottesbueren@kit.edu>", "Tobias Heuer <tobias.heuer@kit.edu>", "Nikolai Maas <nikolai.maas@kit.edu>", "Zizheng Guo <gzz_2000@126.com>"]
 description = "A statically-linked Mt-KaHyPar"
+repository = "https://github.com/gzz2000/mt-kahypar-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
