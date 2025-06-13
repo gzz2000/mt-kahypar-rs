@@ -2,7 +2,18 @@
 name = "mt-kahypar"
 version = "0.1.0"
 edition = "2021"
+links = "mtkahypar"
+license = "MIT OR Apache-2.0"
+authors = ["Lars Gottesbüren <lars.gottesbueren@kit.edu>", "Tobias Heuer <tobias.heuer@kit.edu>", "Nikolai Maas <nikolai.maas@kit.edu>", "Zizheng Guo <gzz_2000@126.com>"]
+description = "A statically-linked Mt-KaHyPar"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+
+[features]
+int64_ids = []
+
+[build-dependencies]
+cc = { version = "1.2.26", features = ["parallel"] }
+glob = "0.3.2"
