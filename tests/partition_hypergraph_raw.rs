@@ -5,7 +5,7 @@ use std::{
     ptr,
 };
 
-use mt_kahypar::raw as ffi;
+use mt_kahypar::sys as ffi;
 
 const EXPECT_IMBALANCE: f64 = 0.023682559598494413;
 const EXPECT_KM1: i32 = 224;

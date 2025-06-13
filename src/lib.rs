@@ -6,4 +6,4 @@
 /// bindgen mt-kahypar-sc/include/mtkahypar.h --default-enum-style rust_non_exhaustive --rust-edition 2021 --rust-target 1.73.0 > src/raw.rs
 /// ```
 #[allow(non_camel_case_types, non_upper_case_globals)]
-pub mod raw;
+pub mod sys;
