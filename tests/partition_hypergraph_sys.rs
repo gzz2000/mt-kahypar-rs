@@ -13,7 +13,7 @@ const EXPECT_BLOCK_WEIGHT_0: i32 = 6225;
 const EXPECT_BLOCK_WEIGHT_1: i32 = 6527;
 
 #[test]
-fn deterministic_partitioning() {
+fn deterministic_partitioning_raw_sys_api() {
     unsafe {
         let mut error = ffi::mt_kahypar_error_t {
             msg: ptr::null(),
