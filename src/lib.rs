@@ -7,3 +7,653 @@
 /// ```
 #[allow(non_camel_case_types, non_upper_case_globals)]
 pub mod sys;
+
+use std::{
+    ffi::{CStr, CString},
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ptr,
+    sync::Once,
+};
+
+static INIT: Once = Once::new();
+
+/// Manual global initialization (optional) of thread pools.
+///
+/// If you want to specify the number of threads, you should call
+/// this prior to creating any context.
+///
+/// You can only call initialize once. Further calls will be ignored.
+pub fn initialize(num_threads: usize, interleaved: bool) {
+    INIT.call_once(|| unsafe {
+        sys::mt_kahypar_initialize(num_threads, interleaved);
+    });
+}
+
+/// Manual global initialization (optional) of thread pools
+/// as default (maximum available) parallelism.
+///
+/// You don't need to remember to call this. If you don't call this,
+/// we will call it for you on your first context initialization.
+pub fn initialize_default() {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    initialize(num_threads, true);
+}
+
+fn ensure_initialized() {
+    if !INIT.is_completed() {
+        let _ = initialize_default();
+    }
+}
+
+/// Library-level error type.
+#[derive(Debug)]
+pub struct Error {
+    pub status: Status,
+    pub message: String,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.status, self.message)
+    }
+}
+impl std::error::Error for Error {}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Mirror of `mt_kahypar_status_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Success,
+    InvalidInput,
+    InvalidParameter,
+    UnsupportedOperation,
+    SystemError,
+    OtherError,
+}
+impl From<sys::mt_kahypar_status_t> for Status {
+    fn from(s: sys::mt_kahypar_status_t) -> Self {
+        use sys::mt_kahypar_status_t::*;
+        match s {
+            SUCCESS => Status::Success,
+            INVALID_INPUT => Status::InvalidInput,
+            INVALID_PARAMETER => Status::InvalidParameter,
+            UNSUPPORTED_OPERATION => Status::UnsupportedOperation,
+            SYSTEM_ERROR => Status::SystemError,
+            // non_exhaustive has no effect in this own crate.
+            OTHER_ERROR => Status::OtherError,
+        }
+    }
+}
+
+/// Objective functions.
+///
+/// See https://github.com/gzz2000/mt-kahypar-sc/tree/master?tab=readme-ov-file#supported-objective-functions
+#[derive(Clone, Copy)]
+pub enum Objective {
+    /// Cut-Net Metric
+    Cut,
+    /// Connectivity Metric
+    Km1,
+    /// Sum-of-external-Degrees Metric
+    Soed,
+}
+impl From<Objective> for sys::mt_kahypar_objective_t {
+    fn from(o: Objective) -> Self {
+        match o {
+            Objective::Cut => sys::mt_kahypar_objective_t::CUT,
+            Objective::Km1 => sys::mt_kahypar_objective_t::KM1,
+            Objective::Soed => sys::mt_kahypar_objective_t::SOED,
+        }
+    }
+}
+
+/// Context presets.
+///
+/// The default is `Deterministic` rather than `Default`.
+#[derive(Clone, Copy, Default)]
+pub enum Preset {
+    #[default]
+    Deterministic,
+    LargeK,
+    Default,
+    Quality,
+    HighestQuality,
+}
+impl From<Preset> for sys::mt_kahypar_preset_type_t {
+    fn from(p: Preset) -> Self {
+        use sys::mt_kahypar_preset_type_t::*;
+        match p {
+            Preset::Deterministic => DETERMINISTIC,
+            Preset::LargeK => LARGE_K,
+            Preset::Default => DEFAULT,
+            Preset::Quality => QUALITY,
+            Preset::HighestQuality => HIGHEST_QUALITY,
+        }
+    }
+}
+
+/// File format.
+#[derive(Clone, Copy)]
+pub enum FileFormat {
+    Metis,
+    HMetis,
+}
+impl From<FileFormat> for sys::mt_kahypar_file_format_type_t {
+    fn from(f: FileFormat) -> Self {
+        match f {
+            FileFormat::Metis => sys::mt_kahypar_file_format_type_t::METIS,
+            FileFormat::HMetis => sys::mt_kahypar_file_format_type_t::HMETIS,
+        }
+    }
+}
+
+/// Handle Mt-KaHyPar error struct <-> Rust error.
+unsafe fn check_status(status: sys::mt_kahypar_status_t, err: &mut sys::mt_kahypar_error_t) -> Result<()> {
+    if status == sys::mt_kahypar_status_t::SUCCESS {
+        return Ok(());
+    }
+    let msg = if !err.msg.is_null() {
+        CStr::from_ptr(err.msg).to_string_lossy().into_owned()
+    } else {
+        "<no error message>".into()
+    };
+    sys::mt_kahypar_free_error_content(err);
+    Err(Error {
+        status: status.into(),
+        message: msg,
+    })
+}
+
+/* ------------------------------------------------------------------------- */
+/* Context & Builder                                                         */
+/* ------------------------------------------------------------------------- */
+
+/// A partitioning context
+pub struct Context {
+    raw: *mut sys::mt_kahypar_context_t,
+}
+unsafe impl Send for Context {}
+unsafe impl Sync for Context {}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        unsafe { sys::mt_kahypar_free_context(self.raw) };
+    }
+}
+
+impl Context {
+    pub fn builder() -> ContextBuilder {
+        ContextBuilder::default()
+    }
+}
+
+#[derive(Default)]
+pub struct ContextBuilder {
+    preset: Preset,
+    k: Option<i32>,
+    epsilon: Option<f64>,
+    objective: Option<Objective>,
+    seed: Option<usize>,
+    verbose: bool,
+}
+
+impl ContextBuilder {
+    /// Apply a preset in the beginning.
+    pub fn preset(mut self, p: Preset) -> Self {
+        self.preset = p;
+        self
+    }
+    /// The number of partitions.
+    pub fn k(mut self, k: i32) -> Self {
+        self.k = Some(k);
+        self
+    }
+    /// The epsilon value (1+epsilon imbalance).
+    pub fn epsilon(mut self, eps: f64) -> Self {
+        self.epsilon = Some(eps);
+        self
+    }
+    /// The objective function used
+    pub fn objective(mut self, obj: Objective) -> Self {
+        self.objective = Some(obj);
+        self
+    }
+    /// Random seed (for deterministic partitioning algorithms)
+    pub fn seed(mut self, seed: usize) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+    /// Whether to print verbose partitioning logs to stderr.
+    pub fn verbose(mut self, v: bool) -> Self {
+        self.verbose = v;
+        self
+    }
+
+    /// Build the context.
+    pub fn build(self) -> Result<Context> {
+        ensure_initialized();
+
+        let raw_ctx =
+            unsafe { sys::mt_kahypar_context_from_preset(self.preset.into()) };
+        if raw_ctx.is_null() {
+            return Err(Error {
+                status: Status::SystemError,
+                message: "mt_kahypar_context_from_preset returned NULL".into(),
+            });
+        }
+
+        unsafe {
+            if let Some(seed) = self.seed {
+                sys::mt_kahypar_set_seed(seed);
+            }
+            if self.verbose {
+                let s = CString::new("1").unwrap();
+                let mut err = MaybeUninit::<sys::mt_kahypar_error_t>::zeroed().assume_init();
+                let st = sys::mt_kahypar_set_context_parameter(
+                    raw_ctx,
+                    sys::mt_kahypar_context_parameter_type_t::VERBOSE,
+                    s.as_ptr(),
+                    &mut err,
+                );
+                check_status(st, &mut err)?;
+            }
+            if let (Some(k), Some(eps), Some(obj)) = (self.k, self.epsilon, self.objective) {
+                sys::mt_kahypar_set_partitioning_parameters(
+                    raw_ctx,
+                    k,
+                    eps,
+                    obj.into(),
+                );
+            }
+        }
+
+        Ok(Context { raw: raw_ctx })
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Hypergraph                                                                */
+/* ------------------------------------------------------------------------- */
+
+/// A (Hyper)graph to be partitioned.
+pub struct Hypergraph<'ctx> {
+    raw: sys::mt_kahypar_hypergraph_t,
+    _marker: PhantomData<&'ctx Context>,
+}
+unsafe impl Send for Hypergraph<'_> {}
+unsafe impl Sync for Hypergraph<'_> {}
+
+impl<'ctx> Drop for Hypergraph<'ctx> {
+    fn drop(&mut self) {
+        unsafe { sys::mt_kahypar_free_hypergraph(self.raw) };
+    }
+}
+
+impl<'ctx> Hypergraph<'ctx> {
+    /// Load from file (Metis / hMetis).
+    ///
+    /// Note that we use different (hyper)graph data structures for different configurations.
+    /// Make sure that you partition the hypergraph with the same configuration as it is loaded.
+    pub fn from_file(path: &str, ctx: &'ctx Context, format: FileFormat) -> Result<Self> {
+        ensure_initialized();
+        let c_path = CString::new(path).unwrap();
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let hg = unsafe {
+            sys::mt_kahypar_read_hypergraph_from_file(
+                c_path.as_ptr(),
+                ctx.raw,
+                format.into(),
+                &mut err,
+            )
+        };
+        if hg.hypergraph.is_null() {
+            return Err(Error {
+                status: Status::InvalidInput,
+                message: unsafe {
+                    let m = CStr::from_ptr(err.msg).to_string_lossy().into_owned();
+                    sys::mt_kahypar_free_error_content(&mut err);
+                    m
+                },
+            });
+        }
+        Ok(Hypergraph {
+            raw: hg,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Constructs a hypergraph from a given adjacency array that specifies the hyperedges.
+    ///
+    /// For example:
+    /// ``` text
+    /// hyperedge_indices: | 0   | 2       | 6     | 9     | 12
+    /// hyperedges:        | 0 2 | 0 1 3 4 | 3 4 6 | 2 5 6 |
+    /// ```
+    /// Defines a hypergraph with four hyperedges, e.g., `e_0 = {0,2}, e_1 = {0,1,3,4}, ...`
+    /// note: For unweighted hypergraphs, you can pass None to either hyperedge_weights or vertex_weights.
+    pub fn from_adjacency(
+        ctx: &'ctx Context,
+        num_vertices: usize,
+        hyperedge_indices: &[usize],
+        hyperedges: &[usize],
+        hyperedge_weights: Option<&[i32]>,
+        vertex_weights: Option<&[i32]>,
+    ) -> Result<Self> {
+        ensure_initialized();
+        assert_eq!(
+            hyperedge_indices.last().copied().unwrap_or(0),
+            hyperedges.len(),
+            "indices array must terminate with |E|"
+        );
+
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let hg = unsafe {
+            sys::mt_kahypar_create_hypergraph(
+                ctx.raw,
+                num_vertices as _,
+                (hyperedge_indices.len() - 1) as _,
+                hyperedge_indices.as_ptr(),
+                hyperedges.as_ptr() as _,
+                hyperedge_weights
+                    .map_or(ptr::null(), |w| w.as_ptr())
+                    as *const sys::mt_kahypar_hyperedge_weight_t,
+                vertex_weights
+                    .map_or(ptr::null(), |w| w.as_ptr())
+                    as *const sys::mt_kahypar_hypernode_weight_t,
+                &mut err,
+            )
+        };
+        if hg.hypergraph.is_null() {
+            return Err(Error {
+                status: Status::InvalidInput,
+                message: unsafe {
+                    let m = CStr::from_ptr(err.msg).to_string_lossy().into_owned();
+                    sys::mt_kahypar_free_error_content(&mut err);
+                    m
+                },
+            });
+        }
+        Ok(Hypergraph {
+            raw: hg,
+            _marker: PhantomData,
+        })
+    }
+
+    /* ------------ Partitioning & Mapping ---------------- */
+
+    /// Partitions a (hyper)graph with the configuration specified in the partitioning context.
+    ///
+    /// Before partitioning, the number of blocks, imbalance parameter and objective function must be set in the partitioning context.
+    pub fn partition(self, ctx: &'ctx Context) -> Result<PartitionedHypergraph<'ctx>> {
+        ensure_initialized();
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let phg =
+            unsafe { sys::mt_kahypar_partition(self.raw, ctx.raw, &mut err) };
+        if phg.partitioned_hg.is_null() {
+            return Err(Error {
+                status: Status::OtherError,
+                message: unsafe {
+                    let m = CStr::from_ptr(err.msg).to_string_lossy().into_owned();
+                    sys::mt_kahypar_free_error_content(&mut err);
+                    m
+                },
+            });
+        }
+        // Hypergraph consumed by C side — do not drop twice
+        std::mem::forget(self);
+        Ok(PartitionedHypergraph {
+            raw: phg,
+            _ctx: PhantomData,
+        })
+    }
+
+    /// Map onto a target graph (Steiner-tree objective).
+    ///
+    /// See [`sys::mt_kahypar_map`].
+    pub fn map(
+        self,
+        target: &mut TargetGraph<'ctx>,
+        ctx: &'ctx Context,
+    ) -> Result<PartitionedHypergraph<'ctx>> {
+        ensure_initialized();
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let phg = unsafe {
+            sys::mt_kahypar_map(self.raw, target.raw, ctx.raw, &mut err)
+        };
+        if phg.partitioned_hg.is_null() {
+            return Err(Error {
+                status: Status::OtherError,
+                message: unsafe {
+                    let m = CStr::from_ptr(err.msg).to_string_lossy().into_owned();
+                    sys::mt_kahypar_free_error_content(&mut err);
+                    m
+                },
+            });
+        }
+        std::mem::forget(self);
+        Ok(PartitionedHypergraph {
+            raw: phg,
+            _ctx: PhantomData,
+        })
+    }
+
+    /* ------------ Introspection ---------------- */
+
+    pub fn num_nodes(&self) -> usize {
+        unsafe { sys::mt_kahypar_num_hypernodes(self.raw) as usize }
+    }
+    pub fn num_edges(&self) -> usize {
+        unsafe { sys::mt_kahypar_num_hyperedges(self.raw) as usize }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* TargetGraph                                                               */
+/* ------------------------------------------------------------------------- */
+
+/// Target graph. See [`sys::mt_kahypar_map`].
+pub struct TargetGraph<'ctx> {
+    raw: *mut sys::mt_kahypar_target_graph_t,
+    _marker: PhantomData<&'ctx Context>,
+}
+unsafe impl Send for TargetGraph<'_> {}
+unsafe impl Sync for TargetGraph<'_> {}
+
+impl<'ctx> Drop for TargetGraph<'ctx> {
+    fn drop(&mut self) {
+        unsafe { sys::mt_kahypar_free_target_graph(self.raw) };
+    }
+}
+
+impl<'ctx> TargetGraph<'ctx> {
+    pub fn from_file(path: &str, ctx: &'ctx Context) -> Result<Self> {
+        ensure_initialized();
+        let c_path = CString::new(path).unwrap();
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let tg = unsafe {
+            sys::mt_kahypar_read_target_graph_from_file(
+                c_path.as_ptr(),
+                ctx.raw,
+                &mut err,
+            )
+        };
+        if tg.is_null() {
+            return Err(Error {
+                status: Status::InvalidInput,
+                message: unsafe {
+                    let m = CStr::from_ptr(err.msg).to_string_lossy().into_owned();
+                    sys::mt_kahypar_free_error_content(&mut err);
+                    m
+                },
+            });
+        }
+        Ok(TargetGraph {
+            raw: tg,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Build from raw edge list.
+    pub fn from_edges(
+        ctx: &'ctx Context,
+        num_vertices: usize,
+        edges: &[(usize, usize)],
+        edge_weights: Option<&[i32]>,
+    ) -> Result<Self> {
+        ensure_initialized();
+        let flat: Vec<usize> =
+            edges.iter().flat_map(|&(u, v)| [u, v]).collect();
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let tg = unsafe {
+            sys::mt_kahypar_create_target_graph(
+                ctx.raw,
+                num_vertices as _,
+                edges.len() as _,
+                flat.as_ptr() as _,
+                edge_weights
+                    .map_or(ptr::null(), |w| w.as_ptr())
+                    as *const sys::mt_kahypar_hyperedge_weight_t,
+                &mut err,
+            )
+        };
+        if tg.is_null() {
+            return Err(Error {
+                status: Status::InvalidInput,
+                message: unsafe {
+                    let m = CStr::from_ptr(err.msg).to_string_lossy().into_owned();
+                    sys::mt_kahypar_free_error_content(&mut err);
+                    m
+                },
+            });
+        }
+        Ok(TargetGraph {
+            raw: tg,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* PartitionedHypergraph                                                     */
+/* ------------------------------------------------------------------------- */
+
+pub struct PartitionedHypergraph<'ctx> {
+    raw: sys::mt_kahypar_partitioned_hypergraph_t,
+    _ctx: PhantomData<&'ctx Context>,
+}
+unsafe impl Send for PartitionedHypergraph<'_> {}
+unsafe impl Sync for PartitionedHypergraph<'_> {}
+
+impl<'ctx> Drop for PartitionedHypergraph<'ctx> {
+    fn drop(&mut self) {
+        unsafe { sys::mt_kahypar_free_partitioned_hypergraph(self.raw) };
+    }
+}
+
+impl<'ctx> PartitionedHypergraph<'ctx> {
+    pub fn improve(
+        &mut self,
+        ctx: &Context,
+        num_vcycles: usize,
+    ) -> Result<()> {
+        ensure_initialized();
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let st = unsafe {
+            sys::mt_kahypar_improve_partition(
+                self.raw,
+                ctx.raw,
+                num_vcycles,
+                &mut err,
+            )
+        };
+        unsafe { check_status(st, &mut err) }
+    }
+
+    pub fn improve_mapping(
+        &mut self,
+        target: &mut TargetGraph,
+        ctx: &Context,
+        num_vcycles: usize,
+    ) -> Result<()> {
+        ensure_initialized();
+        let mut err = sys::mt_kahypar_error_t {
+            msg: ptr::null(),
+            msg_len: 0,
+            status: sys::mt_kahypar_status_t::SUCCESS,
+        };
+        let st = unsafe {
+            sys::mt_kahypar_improve_mapping(
+                self.raw,
+                target.raw,
+                ctx.raw,
+                num_vcycles,
+                &mut err,
+            )
+        };
+        unsafe { check_status(st, &mut err) }
+    }
+
+    pub fn imbalance(&self, ctx: &Context) -> f64 {
+        unsafe { sys::mt_kahypar_imbalance(self.raw, ctx.raw) }
+    }
+    pub fn cut(&self) -> i32 {
+        unsafe { sys::mt_kahypar_cut(self.raw) }
+    }
+    pub fn km1(&self) -> i32 {
+        unsafe { sys::mt_kahypar_km1(self.raw) }
+    }
+    pub fn soed(&self) -> i32 {
+        unsafe { sys::mt_kahypar_soed(self.raw) }
+    }
+
+    pub fn num_blocks(&self) -> i32 {
+        unsafe { sys::mt_kahypar_num_blocks(self.raw) }
+    }
+
+    /// Returns a `Vec` with `n` entries (n = #nodes).
+    pub fn extract_partition(&self, num_nodes: usize) -> Vec<i32> {
+        let mut part = vec![0; num_nodes];
+        unsafe { sys::mt_kahypar_get_partition(self.raw, part.as_mut_ptr()) };
+        part
+    }
+
+    /// Returns block weights.
+    pub fn block_weights(&self) -> Vec<i32> {
+        let n = self.num_blocks() as usize;
+        let mut bw = vec![0; n];
+        unsafe { sys::mt_kahypar_get_block_weights(self.raw, bw.as_mut_ptr()) };
+        bw
+    }
+}
