@@ -2,15 +2,15 @@
 
 use std::env;
 use std::time::SystemTime;
-use cc::Build;
 use glob::glob;
 
 fn main() {
     println!("Building mt-kahypar-sc");
     println!("cargo:rerun-if-changed=mt-kahypar-sc");
 
-    let mut builder_mtkahypar = Build::new();
+    let mut builder_mtkahypar = cc::Build::new();
     builder_mtkahypar
+        .cpp(true)
         .debug(false)
         .opt_level(3)
         .flag("-std=c++17")
@@ -36,8 +36,9 @@ fn main() {
     builder_mtkahypar.compile("mtkahyparsc");
     println!("cargo:rustc-link-lib=static=mtkahyparsc");
 
-    let mut builder_tbbmalloc = Build::new();
+    let mut builder_tbbmalloc = cc::Build::new();
     builder_tbbmalloc
+        .cpp(true)
         .debug(false)
         .opt_level(3)
         .flag("-std=c++17")
@@ -50,8 +51,9 @@ fn main() {
         .compile("tbbmallockahypar");
     println!("cargo:rustc-link-lib=static=tbbmallockahypar");
 
-    let mut builder_tbb = Build::new();
+    let mut builder_tbb = cc::Build::new();
     builder_tbb
+        .cpp(true)
         .debug(false)
         .opt_level(3)
         .flag("-std=c++17")
@@ -63,8 +65,9 @@ fn main() {
         .compile("tbbkahypar");
     println!("cargo:rustc-link-lib=static=tbbkahypar");
 
-    let mut builder_boost = Build::new();
+    let mut builder_boost = cc::Build::new();
     builder_boost
+        .cpp(true)
         .debug(false)
         .opt_level(3)
         .flag("-std=c++17")
